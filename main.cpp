@@ -3,6 +3,7 @@
 #include <QThread>
 #include <QPainter>
 #include <QPainterPath>
+#include <QElapsedTimer>
 #include <QLoggingCategory>
 #include <QMenu>
 #include <QIcon>
@@ -226,7 +227,6 @@ QIcon getBatteryIcon(double percentage, bool charging) {
     return QIcon(pixmap);
 }
 
-static std::string device;
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QStringList args = app.arguments();
@@ -257,8 +257,8 @@ int main(int argc, char* argv[]) {
     tray.setIconByPixmap(initialIcon.pixmap(64, 64));
     tray.setToolTipTitle("HS80 Battery");
     tray.setToolTipSubTitle("Initializing...");
-
-    QMenu *menu = new QMenu();
+    QWidget qwidget = QWidget();
+    QMenu *menu = new QMenu(&qwidget);
     QAction* header = menu->addAction("Corsair HS80");
     header->setIcon(QIcon::fromTheme("audio-headset"));
     header->setDisabled(true); // prevent clicking
