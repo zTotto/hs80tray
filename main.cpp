@@ -12,7 +12,7 @@
 #include <sstream>
 
 #define VENDOR_ID  0x1B1C
-#define PRODUCT_ID 0x0A73
+#define PRODUCT_ID 0x0A6B
 #define BATTERY_LEVEL_EVENT 0x0F
 #define CHARGING_EVENT 0x10
 #define POLL_INTERVAL_MS 200
@@ -113,6 +113,9 @@ public slots:
         // timer to keep track of how long ago we got the last msg
         QElapsedTimer lastMessageTimer;
         lastMessageTimer.start();
+        QElapsedTimer lastRequestTimer;
+        lastRequestTimer.start();
+        
         unsigned char buf[65] = {0};
         if(handle){
             wchar_t wstr[MAX_STR];
@@ -122,18 +125,37 @@ public slots:
             std::wcout << L"Product: " << wstr << std::endl;
             hid_get_serial_number_string(handle, wstr, MAX_STR);
             std::wcout << L"Serial Number: " << wstr << std::endl;
-
-            uint8_t req[65] = {0};
-            req[0] = 0x02;   // Report ID
-            req[1] = 0x08;   // Command group?
-            req[2] = 0x09;   // Subcommand: "get status" (inferred)
-            hid_write(handle, req, sizeof(req));  // or 64 on some backends
         }
+
+        auto sendRequest = [&]() {
+            if (!handle) return;
+            uint8_t req[65] = {0};
+            // Try different requests for HS80
+            req[0] = 0x08;
+            req[1] = 0x01; // Request battery/status
+            hid_write(handle, req, 65);
+            
+            req[0] = 0x02;
+            req[1] = 0x08;
+            req[2] = 0x09;
+            hid_write(handle, req, 65);
+            
+            if(g_verbose) qDebug() << "Status request sent";
+        };
+
+        sendRequest();
 
         while (true) {
             if(QThread::currentThread()->isInterruptionRequested()){
                 return;
             }
+
+            // Periodically request status if no updates received recently
+            if (lastRequestTimer.elapsed() > 5000) { // Every 5 seconds
+                sendRequest();
+                lastRequestTimer.restart();
+            }
+
             int res = hid_read_timeout(handle, buf, sizeof(buf), POLL_INTERVAL_MS);
             if (res > 0) {
                 lastMessageTimer.restart();
@@ -141,42 +163,54 @@ public slots:
                 QByteArray data(reinterpret_cast<const char*>(buf), res);
                 if(g_verbose) qDebug() << "Report ID" << QString::number(buf[0], 16)
                          << "response:" << data.toHex(' ');
-                double percentage;
-                bool charging;
-                switch (buf[3]) {
-                    case BATTERY_LEVEL_EVENT:
-                    {
-                        if (!connected){
-                            connected = true;
-                            if(g_switch_sink) switch_pipewire_sink(sink);
-                        }
-                        // only show tray icon if we have battery info
-                        emit trayActive();
-                        percentage = (buf[5] | (buf[6] << 8)) / 10;
-                        last_percentage = percentage;
-                        if(g_verbose) qDebug() << "Battery:" << percentage << "%";
-                    } break;
-                    case CHARGING_EVENT:
-                    {
-                        if (!connected){
-                            connected = true;
-                            if(g_switch_sink) switch_pipewire_sink(sink);
-                        }
-                        charging = (buf[5] == 1);
-                        last_charging = charging;
-                        if(g_verbose) qDebug() << "Charging: " << (charging ? "true" : "false");
-                    } break;
-                    default:
-                    {} break;
+                
+                double percentage = last_percentage;
+                bool charging = last_charging;
+                
+                uint8_t eventType = buf[3];
+                
+                if (eventType == BATTERY_LEVEL_EVENT) {
+                    double new_p = (buf[5] | (buf[6] << 8)) / 10.0;
+                    if (new_p > 0 && new_p <= 100) {
+                        percentage = new_p;
+                        if(g_verbose) qDebug() << "Battery Event - Percentage:" << percentage << "%";
+                    }
+                } else if (eventType == CHARGING_EVENT) {
+                    if(g_verbose) qDebug() << "Charging Event packet - Byte 5:" << buf[5];
+                    // On some HS80, 2 means 'Discharging/Full' while 1 means 'Charging'
+                    charging = (buf[5] == 1); 
+                    if(g_verbose) qDebug() << "Charging Event - State:" << (charging ? "Charging" : "Battery/Full");
+                } else if (buf[0] == 0x01 && res >= 5) {
+                    if (buf[2] == 0x09) { 
+                         double alt_p = (buf[4] | (buf[5] << 8)) / 10.0;
+                         if (alt_p > 0 && alt_p <= 100) {
+                             percentage = alt_p;
+                             if(g_verbose) qDebug() << "Found Battery in ID 1 - Percentage:" << percentage << "%";
+                         }
+                         if(g_verbose) qDebug() << "Status ID 1 - Byte 3 (State):" << buf[3];
+                    }
                 }
-                emit batteryUpdated(last_percentage, last_charging);
+
+                if (percentage != last_percentage || charging != last_charging || !connected) {
+                    if (!connected && (percentage > 0)) {
+                        connected = true;
+                        if(g_switch_sink) switch_pipewire_sink(sink);
+                        emit trayActive();
+                    }
+                    if (percentage > 0) last_percentage = percentage;
+                    last_charging = charging;
+                    emit batteryUpdated(last_percentage, last_charging);
+                }
             }
             else
             {
                 // No message received after timeout, assuming headset disconnected
                 if (lastMessageTimer.hasExpired(PASSIVE_TIMEOUT_MS)) {
-                    emit trayPassive();
-                    connected = false;
+                    if (connected) {
+                        emit trayPassive();
+                        connected = false;
+                        last_percentage = -1;
+                    }
                 }
             }
         }
