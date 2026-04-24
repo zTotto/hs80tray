@@ -176,8 +176,7 @@ public slots:
                         if(g_verbose) qDebug() << "Battery Event - Percentage:" << percentage << "%";
                     }
                 } else if (eventType == CHARGING_EVENT) {
-                    if(g_verbose) qDebug() << "Charging Event packet - Byte 5:" << buf[5];
-                    // On some HS80, 2 means 'Discharging/Full' while 1 means 'Charging'
+                    // Only update charging status, keep the percentage we already have
                     charging = (buf[5] == 1); 
                     if(g_verbose) qDebug() << "Charging Event - State:" << (charging ? "Charging" : "Battery/Full");
                 } else if (buf[0] == 0x01 && res >= 5) {
@@ -185,9 +184,7 @@ public slots:
                          double alt_p = (buf[4] | (buf[5] << 8)) / 10.0;
                          if (alt_p > 0 && alt_p <= 100) {
                              percentage = alt_p;
-                             if(g_verbose) qDebug() << "Found Battery in ID 1 - Percentage:" << percentage << "%";
                          }
-                         if(g_verbose) qDebug() << "Status ID 1 - Byte 3 (State):" << buf[3];
                     }
                 }
 
