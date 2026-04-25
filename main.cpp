@@ -1,16 +1,26 @@
 #include <KStatusNotifierItem>
 #include <QApplication>
-#include <QThread>
-#include <QPainter>
-#include <QPainterPath>
+#include <QCloseEvent>
+#include <QColorDialog>
+#include <QComboBox>
 #include <QElapsedTimer>
+#include <QFormLayout>
+#include <QIcon>
 #include <QLoggingCategory>
 #include <QMenu>
-#include <QIcon>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPushButton>
+#include <QSettings>
+#include <QThread>
+#include <QVBoxLayout>
 #include <hidapi/hidapi.h>
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -44,6 +54,178 @@ static QString sink;
 struct Sink {
     std::string id;
     std::string name;
+};
+
+struct LedConfig {
+    QColor logoColor;
+    QColor powerColor;
+    QColor micMutedColor;
+    QColor micUnmutedColor;
+};
+
+Q_DECLARE_METATYPE(LedConfig)
+
+static LedConfig defaultLedConfig() {
+    return {
+        QColor(0, 0, 0),
+        QColor(0, 255, 0),
+        QColor(255, 0, 0),
+        QColor(0, 0, 0),
+    };
+}
+
+static QColor readSettingColor(QSettings& settings, const char* key, const QColor& fallback) {
+    if (!settings.contains(key)) return fallback;
+
+    const QVariant value = settings.value(key);
+    QColor color = value.value<QColor>();
+    if (!color.isValid()) color = QColor(value.toString());
+    return color.isValid() ? color : fallback;
+}
+
+static QColor normalizeMicColor(const QColor& color, const QColor& fallback) {
+    const QRgb rgb = color.rgb();
+    if (rgb == QColor(0, 0, 0).rgb()
+        || rgb == QColor(255, 0, 0).rgb()
+        || rgb == QColor(255, 255, 255).rgb()) {
+        return color;
+    }
+    return fallback;
+}
+
+static LedConfig loadLedConfig() {
+    QSettings settings;
+    const LedConfig defaults = defaultLedConfig();
+    return {
+        readSettingColor(settings, "logoColor", defaults.logoColor),
+        readSettingColor(settings, "powerColor", defaults.powerColor),
+        normalizeMicColor(readSettingColor(settings, "micMutedColor", defaults.micMutedColor), defaults.micMutedColor),
+        normalizeMicColor(readSettingColor(settings, "micUnmutedColor", defaults.micUnmutedColor), defaults.micUnmutedColor),
+    };
+}
+
+static void saveLedConfig(const LedConfig& config) {
+    QSettings settings;
+    settings.setValue("logoColor", config.logoColor);
+    settings.setValue("powerColor", config.powerColor);
+    settings.setValue("micMutedColor", config.micMutedColor);
+    settings.setValue("micUnmutedColor", config.micUnmutedColor);
+}
+
+class LedSettingsWindow : public QWidget {
+    Q_OBJECT
+public:
+    explicit LedSettingsWindow(const LedConfig& initialConfig, QWidget* parent = nullptr)
+        : QWidget(parent), config(initialConfig) {
+        setWindowTitle("HS80 LED");
+        setWindowIcon(QIcon::fromTheme("preferences-desktop-display"));
+
+        auto* layout = new QVBoxLayout(this);
+        auto* form = new QFormLayout();
+        layout->addLayout(form);
+
+        powerButton = createColorButton(config.powerColor);
+        logoButton = createColorButton(config.logoColor);
+        form->addRow("Power LED", powerButton);
+        form->addRow("Logo LED", logoButton);
+
+        micMutedCombo = createMicCombo(config.micMutedColor, QColor(255, 0, 0));
+        micUnmutedCombo = createMicCombo(config.micUnmutedColor, QColor(0, 0, 0));
+        form->addRow("Mic muted", micMutedCombo);
+        form->addRow("Mic unmuted", micUnmutedCombo);
+
+        connect(powerButton, &QPushButton::clicked, this, [this]() {
+            chooseColor("Power LED", config.powerColor, [this](const QColor& color) {
+                config.powerColor = color;
+                updateColorButton(powerButton, color);
+            });
+        });
+
+        connect(logoButton, &QPushButton::clicked, this, [this]() {
+            chooseColor("Logo LED", config.logoColor, [this](const QColor& color) {
+                config.logoColor = color;
+                updateColorButton(logoButton, color);
+            });
+        });
+
+        connect(micMutedCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            config.micMutedColor = micColorFromCombo(micMutedCombo);
+            persistAndNotify();
+        });
+
+        connect(micUnmutedCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+            config.micUnmutedColor = micColorFromCombo(micUnmutedCombo);
+            persistAndNotify();
+        });
+
+        setMinimumWidth(320);
+    }
+
+signals:
+    void ledConfigChanged(const LedConfig& config);
+
+protected:
+    void closeEvent(QCloseEvent* event) override {
+        hide();
+        event->ignore();
+    }
+
+private:
+    LedConfig config;
+    QPushButton* powerButton = nullptr;
+    QPushButton* logoButton = nullptr;
+    QComboBox* micMutedCombo = nullptr;
+    QComboBox* micUnmutedCombo = nullptr;
+
+    QPushButton* createColorButton(const QColor& color) {
+        auto* button = new QPushButton(this);
+        button->setMinimumWidth(120);
+        updateColorButton(button, color);
+        return button;
+    }
+
+    void updateColorButton(QPushButton* button, const QColor& color) {
+        button->setText(color.name(QColor::HexRgb).toUpper());
+        button->setStyleSheet(QString(
+            "QPushButton { background-color: %1; color: %2; border: 1px solid palette(mid); padding: 6px 10px; }")
+                                  .arg(color.name(QColor::HexRgb),
+                                       color.lightness() < 128 ? "#ffffff" : "#000000"));
+    }
+
+    void chooseColor(const QString& title, const QColor& currentColor, const std::function<void(const QColor&)>& applyColor) {
+        const QColor color = QColorDialog::getColor(currentColor, this, title);
+        if (!color.isValid()) return;
+
+        applyColor(color);
+        persistAndNotify();
+    }
+
+    QComboBox* createMicCombo(const QColor& color, const QColor& fallback) {
+        auto* combo = new QComboBox(this);
+        combo->addItem("Spento", QColor(0, 0, 0));
+        combo->addItem("Rosso", QColor(255, 0, 0));
+        combo->addItem("Bianco", QColor(255, 255, 255));
+
+        const int index = comboIndexForColor(combo, color);
+        combo->setCurrentIndex(index >= 0 ? index : comboIndexForColor(combo, fallback));
+        return combo;
+    }
+
+    int comboIndexForColor(const QComboBox* combo, const QColor& color) const {
+        for (int i = 0; i < combo->count(); ++i) {
+            if (combo->itemData(i).value<QColor>().rgb() == color.rgb()) return i;
+        }
+        return -1;
+    }
+
+    QColor micColorFromCombo(const QComboBox* combo) const {
+        return combo->currentData().value<QColor>();
+    }
+
+    void persistAndNotify() {
+        saveLedConfig(config);
+        emit ledConfigChanged(config);
+    }
 };
 
 std::vector<Sink> get_sinks() {
@@ -113,12 +295,17 @@ signals:
     void trayActive();
 
 public slots:
+    void updateLedConfig(const LedConfig& config) {
+        QMutexLocker locker(&ledConfigMutex);
+        ledConfig = config;
+        ledDirty = true;
+    }
+
     void startPolling() {
         hid_init();
         bool connected = false;
         bool headsetResponding = true;
         bool micMuted = false;
-        bool ledDirty = true;
         bool lightingDirty = true;
         handle = nullptr;
         while (!handle && !QThread::currentThread()->isInterruptionRequested()) {
@@ -157,9 +344,9 @@ public slots:
 
         QThread::msleep(INITIAL_BATTERY_REQUEST_DELAY_MS);
         configureLighting();
+        clearLedDirty();
         sendLedState(micMuted);
         lightingDirty = false;
-        ledDirty = false;
         lastLightingTimer.restart();
         lastLedTimer.restart();
         requestBattery();
@@ -193,15 +380,15 @@ public slots:
             }
 
             bool ledKeepaliveDue = lastLedTimer.elapsed() > LED_KEEPALIVE_INTERVAL_MS;
-            bool ledChangeDue = (ledDirty || lightingDirty) && lastLedTimer.elapsed() > LED_MIN_UPDATE_INTERVAL_MS;
+            bool ledChangeDue = (isLedDirty() || lightingDirty) && lastLedTimer.elapsed() > LED_MIN_UPDATE_INTERVAL_MS;
             if (ledKeepaliveDue || ledChangeDue) {
                 if (lightingDirty) {
                     configureLighting();
                     lightingDirty = false;
                     lastLightingTimer.restart();
                 }
+                clearLedDirty();
                 sendLedState(micMuted);
-                ledDirty = false;
                 lastLedTimer.restart();
             }
 
@@ -210,7 +397,7 @@ public slots:
                 bool refreshAfterResponse = false;
                 if (!headsetResponding) {
                     lightingDirty = true;
-                    ledDirty = true;
+                    markLedDirty();
                     refreshAfterResponse = true;
                     if(g_verbose) qDebug() << "Headset response restored, lighting resync queued";
                 }
@@ -239,7 +426,7 @@ public slots:
                     bool newMicMuted = parseMicMuted(buf, res);
                     if (newMicMuted != micMuted) {
                         micMuted = newMicMuted;
-                        ledDirty = true;
+                        markLedDirty();
                     }
                     if(g_verbose) qDebug() << "Mic Event - State:" << (micMuted ? "Muted" : "Active");
                 } else if (isQueryResponse(buf, res)) {
@@ -253,7 +440,7 @@ public slots:
                         bool newMicMuted = parseMicMuted(buf, res);
                         if (newMicMuted != micMuted) {
                             micMuted = newMicMuted;
-                            ledDirty = true;
+                            markLedDirty();
                         }
                         if(g_verbose) qDebug() << "Mic Response - State:" << (micMuted ? "Muted" : "Active");
                     } else if (isQueryResponseChargingState(buf, res)) {
@@ -309,6 +496,29 @@ private:
 
     hid_device* handle = nullptr;
     std::deque<QueryKind> pendingQueries;
+    QMutex ledConfigMutex;
+    LedConfig ledConfig = defaultLedConfig();
+    bool ledDirty = true;
+
+    bool isLedDirty() {
+        QMutexLocker locker(&ledConfigMutex);
+        return ledDirty;
+    }
+
+    void markLedDirty() {
+        QMutexLocker locker(&ledConfigMutex);
+        ledDirty = true;
+    }
+
+    void clearLedDirty() {
+        QMutexLocker locker(&ledConfigMutex);
+        ledDirty = false;
+    }
+
+    LedConfig currentLedConfig() {
+        QMutexLocker locker(&ledConfigMutex);
+        return ledConfig;
+    }
 
     hid_device* openHs80Interface() {
         hid_device_info* devs = hid_enumerate(VENDOR_ID, PRODUCT_ID);
@@ -399,14 +609,24 @@ private:
     }
 
     void sendLedState(bool micMuted) {
+        const LedConfig config = currentLedConfig();
+        const QColor micColor = micMuted ? config.micMutedColor : config.micUnmutedColor;
+
         uint8_t buf[REPORT_SIZE] = {0};
         buf[0] = 0x02;
         buf[1] = HEADSET_MODE_WIRELESS;
         buf[2] = 0x06;
         buf[3] = 0x00;
         buf[4] = 0x09;
-        buf[10] = micMuted ? 255 : 0;
-        buf[12] = 255;
+        buf[8] = static_cast<uint8_t>(config.logoColor.red());
+        buf[9] = static_cast<uint8_t>(config.powerColor.red());
+        buf[10] = static_cast<uint8_t>(micColor.red());
+        buf[11] = static_cast<uint8_t>(config.logoColor.green());
+        buf[12] = static_cast<uint8_t>(config.powerColor.green());
+        buf[13] = static_cast<uint8_t>(micColor.green());
+        buf[14] = static_cast<uint8_t>(config.logoColor.blue());
+        buf[15] = static_cast<uint8_t>(config.powerColor.blue());
+        buf[16] = static_cast<uint8_t>(micColor.blue());
 
         if (handle) hid_write(handle, buf, sizeof(buf));
         if(g_verbose) qDebug() << "LED state sent:" << (micMuted ? "muted" : "active");
@@ -521,6 +741,11 @@ QIcon getBatteryIcon(double percentage, bool charging) {
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
+    QApplication::setOrganizationName("hs80tray");
+    QApplication::setApplicationName("hs80tray");
+    app.setQuitOnLastWindowClosed(false);
+    qRegisterMetaType<LedConfig>("LedConfig");
+
     QStringList args = app.arguments();
     for (int i = 1; i < args.size(); ++i) {
         if (args[i] == "-h" || args[i] == "--help") {
@@ -565,12 +790,26 @@ int main(int argc, char* argv[]) {
     menu->addSeparator();
     tray.setContextMenu(menu);
 
+    const LedConfig initialLedConfig = loadLedConfig();
+    LedSettingsWindow ledSettingsWindow(initialLedConfig);
+    QObject::connect(&tray, &KStatusNotifierItem::activateRequested,
+                     &app,
+                     [&ledSettingsWindow](bool, const QPoint&) {
+        ledSettingsWindow.show();
+        ledSettingsWindow.raise();
+        ledSettingsWindow.activateWindow();
+    });
+
     // Worker thread for HID polling
     QThread *workerThread = new QThread();
     HIDWorker* worker = new HIDWorker;
+    worker->updateLedConfig(initialLedConfig);
     worker->moveToThread(workerThread);
 
     QObject::connect(workerThread, &QThread::started, worker, &HIDWorker::startPolling);
+    QObject::connect(&ledSettingsWindow, &LedSettingsWindow::ledConfigChanged,
+                     worker, &HIDWorker::updateLedConfig,
+                     Qt::DirectConnection);
     QObject::connect(worker, &HIDWorker::batteryUpdated,
                      &app,
                      [&tray, batteryAction, chargingAction](double percentage, bool charging){
