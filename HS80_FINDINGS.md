@@ -4,7 +4,7 @@
 Per evitare disconnessioni del dongle, la comunicazione deve seguire un ritmo costante e non eccessivo:
 1. **Handshake**: Inviato ogni 10 secondi per mantenere la Software Mode.
 2. **Polling Stato**: Ogni 100ms (ascolto passivo o timeout su Interfaccia 3).
-3. **Sincronizzazione LED**: Ogni 2 secondi. Inviare un singolo pacchetto che aggiorna tutti i LED in base all'ultimo stato rilevato.
+3. **Sincronizzazione LED**: Inviare subito quando cambia lo stato microfono, con un intervallo minimo anti-spam, e mantenere comunque un keepalive ogni 2 secondi. Evitare una logica basata solo sugli eventi mic: se un evento viene perso o la software mode decade, il colore resta desincronizzato.
 
 ## 1. Handshake (Software Mode)
 Inviare questi pacchetti all'Interfaccia 3:
