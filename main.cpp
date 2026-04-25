@@ -10,6 +10,7 @@
 #include <hidapi/hidapi.h>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -18,6 +19,7 @@
 #define PRODUCT_ID 0x0A6B
 #define BATTERY_LEVEL_EVENT 0x0F
 #define CHARGING_EVENT 0x10
+#define MIC_STATUS_EVENT 0xA6
 #define POLL_INTERVAL_MS 200
 #define MAX_STR 255
 #define REPORT_SIZE 65
@@ -31,7 +33,12 @@ static const int PASSIVE_TIMEOUT_MS = 30 * 60 * 1000;
 static const int INITIAL_BATTERY_REQUEST_DELAY_MS = 1000;
 static const int UNKNOWN_BATTERY_REQUEST_INTERVAL_MS = 2000;
 static const int BATTERY_REQUEST_INTERVAL_MS = 60 * 1000;
+static const int MIC_REQUEST_INTERVAL_MS = 1000;
 static const int STATUS_REQUEST_INTERVAL_MS = 10 * 1000;
+static const int LIGHTING_HANDSHAKE_INTERVAL_MS = 10 * 1000;
+static const int LED_KEEPALIVE_INTERVAL_MS = 2 * 1000;
+static const int LED_MIN_UPDATE_INTERVAL_MS = 250;
+static const int HEADSET_RESPONSE_TIMEOUT_MS = 3000;
 static QString sink;
 
 struct Sink {
@@ -109,6 +116,10 @@ public slots:
     void startPolling() {
         hid_init();
         bool connected = false;
+        bool headsetResponding = true;
+        bool micMuted = false;
+        bool ledDirty = true;
+        bool lightingDirty = true;
         handle = nullptr;
         while (!handle && !QThread::currentThread()->isInterruptionRequested()) {
             handle = openHs80Interface();
@@ -124,8 +135,14 @@ public slots:
         lastMessageTimer.start();
         QElapsedTimer lastBatteryRequestTimer;
         lastBatteryRequestTimer.start();
+        QElapsedTimer lastMicRequestTimer;
+        lastMicRequestTimer.start();
         QElapsedTimer lastStatusRequestTimer;
         lastStatusRequestTimer.start();
+        QElapsedTimer lastLightingTimer;
+        lastLightingTimer.start();
+        QElapsedTimer lastLedTimer;
+        lastLedTimer.start();
         
         unsigned char buf[REPORT_SIZE] = {0};
         if(handle){
@@ -139,11 +156,27 @@ public slots:
         }
 
         QThread::msleep(INITIAL_BATTERY_REQUEST_DELAY_MS);
+        configureLighting();
+        sendLedState(micMuted);
+        lightingDirty = false;
+        ledDirty = false;
+        lastLightingTimer.restart();
+        lastLedTimer.restart();
         requestBattery();
+        requestMicStatus();
 
         while (true) {
             if(QThread::currentThread()->isInterruptionRequested()){
                 return;
+            }
+
+            if (lastLightingTimer.elapsed() > LIGHTING_HANDSHAKE_INTERVAL_MS) {
+                lightingDirty = true;
+            }
+
+            if (lastMicRequestTimer.elapsed() > MIC_REQUEST_INTERVAL_MS) {
+                requestMicStatus();
+                lastMicRequestTimer.restart();
             }
 
             if (lastStatusRequestTimer.elapsed() > STATUS_REQUEST_INTERVAL_MS) {
@@ -159,8 +192,29 @@ public slots:
                 lastBatteryRequestTimer.restart();
             }
 
+            bool ledKeepaliveDue = lastLedTimer.elapsed() > LED_KEEPALIVE_INTERVAL_MS;
+            bool ledChangeDue = (ledDirty || lightingDirty) && lastLedTimer.elapsed() > LED_MIN_UPDATE_INTERVAL_MS;
+            if (ledKeepaliveDue || ledChangeDue) {
+                if (lightingDirty) {
+                    configureLighting();
+                    lightingDirty = false;
+                    lastLightingTimer.restart();
+                }
+                sendLedState(micMuted);
+                ledDirty = false;
+                lastLedTimer.restart();
+            }
+
             int res = hid_read_timeout(handle, buf, sizeof(buf), POLL_INTERVAL_MS);
             if (res > 0) {
+                bool refreshAfterResponse = false;
+                if (!headsetResponding) {
+                    lightingDirty = true;
+                    ledDirty = true;
+                    refreshAfterResponse = true;
+                    if(g_verbose) qDebug() << "Headset response restored, lighting resync queued";
+                }
+                headsetResponding = true;
                 lastMessageTimer.restart();
 
                 QByteArray data(reinterpret_cast<const char*>(buf), res);
@@ -181,12 +235,30 @@ public slots:
                 } else if (eventType == CHARGING_EVENT) {
                     charging = parseChargingState(buf, res);
                     if(g_verbose) qDebug() << "Charging Event - State:" << (charging ? "Charging" : "Battery/Full");
+                } else if (eventType == MIC_STATUS_EVENT) {
+                    bool newMicMuted = parseMicMuted(buf, res);
+                    if (newMicMuted != micMuted) {
+                        micMuted = newMicMuted;
+                        ledDirty = true;
+                    }
+                    if(g_verbose) qDebug() << "Mic Event - State:" << (micMuted ? "Muted" : "Active");
                 } else if (isQueryResponse(buf, res)) {
                     double responsePercentage = readQueryResponseBatteryPercentage(buf, res);
                     if (responsePercentage > 0) {
+                        discardPendingQuery(QueryKind::BatteryLevel);
                         percentage = responsePercentage;
                         if(g_verbose) qDebug() << "Battery Response - Percentage:" << percentage << "%";
+                    } else if (isQueryResponseMicState(buf, res) && peekPendingQuery() == QueryKind::MicStatus) {
+                        takePendingQuery();
+                        bool newMicMuted = parseMicMuted(buf, res);
+                        if (newMicMuted != micMuted) {
+                            micMuted = newMicMuted;
+                            ledDirty = true;
+                        }
+                        if(g_verbose) qDebug() << "Mic Response - State:" << (micMuted ? "Muted" : "Active");
                     } else if (isQueryResponseChargingState(buf, res)) {
+                        discardPendingQuery(QueryKind::BatteryStatus);
+                        discardPendingQuery(QueryKind::SleepStatus);
                         charging = parseChargingState(buf, res);
                         if(g_verbose) qDebug() << "Charging Response - State:" << (charging ? "Charging" : "Battery/Full");
                     }
@@ -202,9 +274,18 @@ public slots:
                     last_charging = charging;
                     emit batteryUpdated(last_percentage, last_charging);
                 }
+
+                if (refreshAfterResponse) {
+                    requestBattery();
+                    requestMicStatus();
+                }
             }
             else
             {
+                if (lastMessageTimer.hasExpired(HEADSET_RESPONSE_TIMEOUT_MS)) {
+                    headsetResponding = false;
+                }
+
                 // No message received after timeout, assuming headset disconnected
                 if (lastMessageTimer.hasExpired(PASSIVE_TIMEOUT_MS)) {
                     if (connected) {
@@ -218,7 +299,16 @@ public slots:
     }
 
 private:
+    enum class QueryKind {
+        None,
+        BatteryLevel,
+        BatteryStatus,
+        SleepStatus,
+        MicStatus,
+    };
+
     hid_device* handle = nullptr;
+    std::deque<QueryKind> pendingQueries;
 
     hid_device* openHs80Interface() {
         hid_device_info* devs = hid_enumerate(VENDOR_ID, PRODUCT_ID);
@@ -254,18 +344,72 @@ private:
 
         uint8_t buf[REPORT_SIZE] = {0};
         while (hid_read_timeout(handle, buf, sizeof(buf), 0) > 0) {}
+        pendingQueries.clear();
+    }
+
+    void writeQuery(const std::vector<uint8_t>& packet, QueryKind kind) {
+        writePacket(packet);
+        pendingQueries.push_back(kind);
+    }
+
+    QueryKind takePendingQuery() {
+        if (pendingQueries.empty()) return QueryKind::None;
+
+        QueryKind kind = pendingQueries.front();
+        pendingQueries.pop_front();
+        return kind;
+    }
+
+    QueryKind peekPendingQuery() const {
+        if (pendingQueries.empty()) return QueryKind::None;
+
+        return pendingQueries.front();
+    }
+
+    void discardPendingQuery(QueryKind kind) {
+        for (auto it = pendingQueries.begin(); it != pendingQueries.end(); ++it) {
+            if (*it == kind) {
+                pendingQueries.erase(it);
+                return;
+            }
+        }
+    }
+
+    void configureLighting() {
+        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x01, 0x03, 0x00, 0x02});
+        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x0D, 0x00, 0x01});
+        if(g_verbose) qDebug() << "Lighting endpoint configured";
     }
 
     void requestBattery() {
         drainReadBuffer();
-        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, BATTERY_LEVEL_EVENT, 0x00});
+        writeQuery({0x02, HEADSET_MODE_WIRELESS, 0x02, BATTERY_LEVEL_EVENT, 0x00}, QueryKind::BatteryLevel);
         QThread::msleep(50);
-        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00});
+        writeQuery({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00}, QueryKind::BatteryStatus);
         if(g_verbose) qDebug() << "Battery request sent";
     }
 
+    void requestMicStatus() {
+        writeQuery({0x02, HEADSET_MODE_WIRELESS, 0x02, MIC_STATUS_EVENT, 0x00}, QueryKind::MicStatus);
+        if(g_verbose) qDebug() << "Mic status request sent";
+    }
+
     void requestSleepStatus() {
-        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00});
+        writeQuery({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00}, QueryKind::SleepStatus);
+    }
+
+    void sendLedState(bool micMuted) {
+        uint8_t buf[REPORT_SIZE] = {0};
+        buf[0] = 0x02;
+        buf[1] = HEADSET_MODE_WIRELESS;
+        buf[2] = 0x06;
+        buf[3] = 0x00;
+        buf[4] = 0x09;
+        buf[10] = micMuted ? 255 : 0;
+        buf[12] = 255;
+
+        if (handle) hid_write(handle, buf, sizeof(buf));
+        if(g_verbose) qDebug() << "LED state sent:" << (micMuted ? "muted" : "active");
     }
 
     double readBatteryPercentage(const uint8_t* buf, int res) {
@@ -301,6 +445,10 @@ private:
         return isQueryResponse(buf, res) && buf[4] >= 1 && buf[4] <= 3 && buf[5] == 0;
     }
 
+    bool isQueryResponseMicState(const uint8_t* buf, int res) {
+        return isQueryResponse(buf, res) && (buf[4] == 0 || buf[4] == 1) && buf[5] == 0;
+    }
+
     bool parseChargingState(const uint8_t* buf, int res) {
         uint8_t state = 0;
         if (res > 5 && buf[5] >= 1 && buf[5] <= 3) {
@@ -310,6 +458,22 @@ private:
         }
 
         return state == 1;
+    }
+
+    bool parseMicMuted(const uint8_t* buf, int res) {
+        if (isQueryResponse(buf, res) && res > 4) {
+            return buf[4] == 1;
+        }
+
+        if (res > 5 && (buf[5] == 0 || buf[5] == 1)) {
+            return buf[5] == 1;
+        }
+
+        if (res > 4) {
+            return buf[4] == 1;
+        }
+
+        return false;
     }
 
 };
