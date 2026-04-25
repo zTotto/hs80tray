@@ -8,8 +8,11 @@
 #include <QMenu>
 #include <QIcon>
 #include <hidapi/hidapi.h>
+#include <array>
+#include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 #define VENDOR_ID  0x1B1C
 #define PRODUCT_ID 0x0A6B
@@ -17,12 +20,18 @@
 #define CHARGING_EVENT 0x10
 #define POLL_INTERVAL_MS 200
 #define MAX_STR 255
+#define REPORT_SIZE 65
+#define HEADSET_MODE_WIRELESS 0x09
 
 static bool g_verbose = false;
 static bool g_switch_sink = false;
 static int last_charging = false;
 static double last_percentage = -1;
 static const int PASSIVE_TIMEOUT_MS = 30 * 60 * 1000;
+static const int INITIAL_BATTERY_REQUEST_DELAY_MS = 1000;
+static const int UNKNOWN_BATTERY_REQUEST_INTERVAL_MS = 2000;
+static const int BATTERY_REQUEST_INTERVAL_MS = 60 * 1000;
+static const int STATUS_REQUEST_INTERVAL_MS = 10 * 1000;
 static QString sink;
 
 struct Sink {
@@ -102,7 +111,7 @@ public slots:
         bool connected = false;
         handle = nullptr;
         while (!handle && !QThread::currentThread()->isInterruptionRequested()) {
-            handle = hid_open(VENDOR_ID, PRODUCT_ID, nullptr);
+            handle = openHs80Interface();
             if (!handle) {
                 std::wcout << L"Unable to open HID device, retrying in 30 seconds..." << std::endl;
                 std::wcout << L"Is the Wireless Receiver connected?" << std::endl;
@@ -113,10 +122,12 @@ public slots:
         // timer to keep track of how long ago we got the last msg
         QElapsedTimer lastMessageTimer;
         lastMessageTimer.start();
-        QElapsedTimer lastRequestTimer;
-        lastRequestTimer.start();
+        QElapsedTimer lastBatteryRequestTimer;
+        lastBatteryRequestTimer.start();
+        QElapsedTimer lastStatusRequestTimer;
+        lastStatusRequestTimer.start();
         
-        unsigned char buf[65] = {0};
+        unsigned char buf[REPORT_SIZE] = {0};
         if(handle){
             wchar_t wstr[MAX_STR];
             hid_get_manufacturer_string(handle, wstr, MAX_STR);
@@ -127,33 +138,25 @@ public slots:
             std::wcout << L"Serial Number: " << wstr << std::endl;
         }
 
-        auto sendRequest = [&]() {
-            if (!handle) return;
-            uint8_t req[65] = {0};
-            // Try different requests for HS80
-            req[0] = 0x08;
-            req[1] = 0x01; // Request battery/status
-            hid_write(handle, req, 65);
-            
-            req[0] = 0x02;
-            req[1] = 0x08;
-            req[2] = 0x09;
-            hid_write(handle, req, 65);
-            
-            if(g_verbose) qDebug() << "Status request sent";
-        };
-
-        sendRequest();
+        QThread::msleep(INITIAL_BATTERY_REQUEST_DELAY_MS);
+        requestBattery();
 
         while (true) {
             if(QThread::currentThread()->isInterruptionRequested()){
                 return;
             }
 
-            // Periodically request status if no updates received recently
-            if (lastRequestTimer.elapsed() > 5000) { // Every 5 seconds
-                sendRequest();
-                lastRequestTimer.restart();
+            if (lastStatusRequestTimer.elapsed() > STATUS_REQUEST_INTERVAL_MS) {
+                requestSleepStatus();
+                lastStatusRequestTimer.restart();
+            }
+
+            int batteryRequestInterval = last_percentage > 0
+                                             ? BATTERY_REQUEST_INTERVAL_MS
+                                             : UNKNOWN_BATTERY_REQUEST_INTERVAL_MS;
+            if (lastBatteryRequestTimer.elapsed() > batteryRequestInterval) {
+                requestBattery();
+                lastBatteryRequestTimer.restart();
             }
 
             int res = hid_read_timeout(handle, buf, sizeof(buf), POLL_INTERVAL_MS);
@@ -170,21 +173,22 @@ public slots:
                 uint8_t eventType = buf[3];
                 
                 if (eventType == BATTERY_LEVEL_EVENT) {
-                    double new_p = (buf[5] | (buf[6] << 8)) / 10.0;
+                    double new_p = readBatteryPercentage(buf, res);
                     if (new_p > 0 && new_p <= 100) {
                         percentage = new_p;
                         if(g_verbose) qDebug() << "Battery Event - Percentage:" << percentage << "%";
                     }
                 } else if (eventType == CHARGING_EVENT) {
-                    // Only update charging status, keep the percentage we already have
-                    charging = (buf[5] == 1); 
+                    charging = parseChargingState(buf, res);
                     if(g_verbose) qDebug() << "Charging Event - State:" << (charging ? "Charging" : "Battery/Full");
-                } else if (buf[0] == 0x01 && res >= 5) {
-                    if (buf[2] == 0x09) { 
-                         double alt_p = (buf[4] | (buf[5] << 8)) / 10.0;
-                         if (alt_p > 0 && alt_p <= 100) {
-                             percentage = alt_p;
-                         }
+                } else if (isQueryResponse(buf, res)) {
+                    double responsePercentage = readQueryResponseBatteryPercentage(buf, res);
+                    if (responsePercentage > 0) {
+                        percentage = responsePercentage;
+                        if(g_verbose) qDebug() << "Battery Response - Percentage:" << percentage << "%";
+                    } else if (isQueryResponseChargingState(buf, res)) {
+                        charging = parseChargingState(buf, res);
+                        if(g_verbose) qDebug() << "Charging Response - State:" << (charging ? "Charging" : "Battery/Full");
                     }
                 }
 
@@ -215,6 +219,99 @@ public slots:
 
 private:
     hid_device* handle = nullptr;
+
+    hid_device* openHs80Interface() {
+        hid_device_info* devs = hid_enumerate(VENDOR_ID, PRODUCT_ID);
+        hid_device_info* curDev = devs;
+        hid_device* opened = nullptr;
+
+        while (curDev) {
+            if (curDev->interface_number == 3) {
+                opened = hid_open_path(curDev->path);
+                if (opened) break;
+            }
+            curDev = curDev->next;
+        }
+
+        hid_free_enumeration(devs);
+        return opened;
+    }
+
+    void writePacket(const std::vector<uint8_t>& packet) {
+        if (!handle) return;
+
+        uint8_t buf[REPORT_SIZE] = {0};
+        for (size_t i = 0; i < packet.size() && i < REPORT_SIZE; ++i) {
+            buf[i] = packet[i];
+        }
+
+        int res = hid_write(handle, buf, sizeof(buf));
+        if(g_verbose && res < 0) qDebug() << "hid_write failed";
+    }
+
+    void drainReadBuffer() {
+        if (!handle) return;
+
+        uint8_t buf[REPORT_SIZE] = {0};
+        while (hid_read_timeout(handle, buf, sizeof(buf), 0) > 0) {}
+    }
+
+    void requestBattery() {
+        drainReadBuffer();
+        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, BATTERY_LEVEL_EVENT, 0x00});
+        QThread::msleep(50);
+        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00});
+        if(g_verbose) qDebug() << "Battery request sent";
+    }
+
+    void requestSleepStatus() {
+        writePacket({0x02, HEADSET_MODE_WIRELESS, 0x02, CHARGING_EVENT, 0x00});
+    }
+
+    double readBatteryPercentage(const uint8_t* buf, int res) {
+        if (res > 6) {
+            double eventValue = (buf[5] | (buf[6] << 8)) / 10.0;
+            if (eventValue > 0 && eventValue <= 100) return eventValue;
+        }
+
+        if (res > 5) {
+            double responseValue = (buf[4] | (buf[5] << 8)) / 10.0;
+            if (responseValue > 0 && responseValue <= 100) return responseValue;
+        }
+
+        return -1;
+    }
+
+    bool isQueryResponse(const uint8_t* buf, int res) {
+        return res > 5 && buf[0] == 0x01 && buf[1] == 0x01 && buf[2] == 0x02 && buf[3] == 0x00;
+    }
+
+    double readQueryResponseBatteryPercentage(const uint8_t* buf, int res) {
+        if (!isQueryResponse(buf, res)) return -1;
+
+        int rawValue = buf[4] | (buf[5] << 8);
+        if (rawValue > 100 && rawValue <= 1000) {
+            return rawValue / 10.0;
+        }
+
+        return -1;
+    }
+
+    bool isQueryResponseChargingState(const uint8_t* buf, int res) {
+        return isQueryResponse(buf, res) && buf[4] >= 1 && buf[4] <= 3 && buf[5] == 0;
+    }
+
+    bool parseChargingState(const uint8_t* buf, int res) {
+        uint8_t state = 0;
+        if (res > 5 && buf[5] >= 1 && buf[5] <= 3) {
+            state = buf[5];
+        } else if (res > 4) {
+            state = buf[4];
+        }
+
+        return state == 1;
+    }
+
 };
 
 QIcon getBatteryIcon(double percentage, bool charging) {
@@ -351,4 +448,3 @@ int main(int argc, char* argv[]) {
 }
 
 #include "main.moc"
-
