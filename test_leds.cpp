@@ -55,8 +55,8 @@ int main() {
             std::cout << "\rSTATO RILEVATO: " << (mic_muted ? "MUTO" : "ATTIVO") << "    " << std::flush;
         }
 
-        // 3. Sincronizza LED ogni 2 secondi
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_led_time).count() >= 2) {
+        // 3. Sincronizza LED ogni secondo
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_led_time).count() >= 1) {
             unsigned char led_pkt[65] = {0};
             led_pkt[0] = 0x02; led_pkt[1] = 0x09; led_pkt[2] = 0x06; led_pkt[3] = 0x00;
             led_pkt[4] = 0x09; 
