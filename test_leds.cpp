@@ -31,26 +31,45 @@ int main() {
 
     if (!h) return 1;
 
-    std::cout << "BASELINE STABILE: Power Verde, Logo Off, Mic Off." << std::endl;
+    std::cout << "--- STEP 2.8: SYNC TOTALE (STABILE + DINAMICO) ---" << std::endl;
 
-    int count = 0;
+    unsigned char read_buf[65];
+    bool mic_muted = false;
+    auto last_led_time = std::chrono::steady_clock::now();
+    auto last_handshake_time = std::chrono::steady_clock::now();
+
     while (true) {
-        if (count % 5 == 0) {
+        auto now = std::chrono::steady_clock::now();
+
+        // 1. Handshake ogni 10 secondi
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_handshake_time).count() >= 10) {
             send_cmd(h, {0x01, 0x03, 0x00, 0x02});
             send_cmd(h, {0x0D, 0x00, 0x01});
+            last_handshake_time = now;
         }
 
-        unsigned char led_pkt[65] = {0};
-        led_pkt[0] = 0x02; led_pkt[1] = 0x09; led_pkt[2] = 0x06; led_pkt[3] = 0x00;
-        led_pkt[4] = 0x09; 
-        
-        led_pkt[8] = 0;   led_pkt[9] = 0;   led_pkt[10] = 0;   // Rossi
-        led_pkt[11] = 0;  led_pkt[12] = 255; led_pkt[13] = 0;   // Verdi (Power G:255)
-        led_pkt[14] = 0;  led_pkt[15] = 0;   led_pkt[16] = 0;   // Blu
+        // 2. Leggi stato microfono (Reattivo 100ms)
+        int res = hid_read_timeout(h, read_buf, 65, 100);
+        if (res > 0 && read_buf[0] == 0x03 && read_buf[3] == 0xA6) {
+            mic_muted = (read_buf[5] == 1);
+            std::cout << "\rSTATO RILEVATO: " << (mic_muted ? "MUTO" : "ATTIVO") << "    " << std::flush;
+        }
 
-        hid_write(h, led_pkt, 65);
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        count++;
+        // 3. Sincronizza LED ogni 2 secondi
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_led_time).count() >= 2) {
+            unsigned char led_pkt[65] = {0};
+            led_pkt[0] = 0x02; led_pkt[1] = 0x09; led_pkt[2] = 0x06; led_pkt[3] = 0x00;
+            led_pkt[4] = 0x09; 
+            
+            int mr = mic_muted ? 255 : 0;
+            led_pkt[10] = mr;  // Mic (I2)
+            led_pkt[12] = 255; // Power Verde (I1)
+            
+            hid_write(h, led_pkt, 65);
+            last_led_time = now;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     hid_exit();
